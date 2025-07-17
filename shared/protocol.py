@@ -1,4 +1,3 @@
-# shared/protocol.py
 import json
 import struct
 import base64

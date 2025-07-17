@@ -1,4 +1,3 @@
-# shared/config.py
 import os
 from cryptography.fernet import Fernet
 

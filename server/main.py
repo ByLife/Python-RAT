@@ -1,4 +1,3 @@
-# server/main.py
 import threading
 import time
 import os
