@@ -1,3 +1,4 @@
+
 CLIENT_TEMPLATE = '''#!/usr/bin/env python3
 # {filename}
 # Generated RAT Client
